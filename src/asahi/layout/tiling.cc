@@ -263,8 +263,10 @@ ail_tile_32bpp(void *_tiled, void *_linear,
  * block, gathered from or scattered to the linear rows through a table of
  * offsets, while the tiled side is written or read as one sequential line.
  * Video planes (R8, R8G8) take this path; one store per element to
- * write-combined memory made a 4K frame upload take ~15 ms. Tiles the box
- * only partially covers fall back to memcpy_small.
+ * write-combined memory made a 4K frame upload take ~15 ms. In a tile the box
+ * only partially covers, the lines it wholly covers take the same path and
+ * only the parts of the others in the box fall back to memcpy_small: the
+ * bottom tiles of a 2160-row plane hold 112 of their 128 rows.
  */
 template <typename T, bool is_store>
 static void
@@ -284,10 +286,17 @@ ail_lines_small(void *_tiled, void *_linear,
    T *tiled = (T *)_tiled;
    uint8_t *linear = (uint8_t *)_linear;
    unsigned offs[64];
+   /* The block a line holds */
+   unsigned line_w = 0, line_h = 0;
 
-   for (unsigned e = 0; e < n; ++e)
-      offs[e] = ail_compact_bits(e & space_mask_x) * sizeof(T) +
-                ail_compact_bits((e & space_mask_y) >> 1) * linear_pitch_B;
+   for (unsigned e = 0; e < n; ++e) {
+      unsigned dx = ail_compact_bits(e & space_mask_x);
+      unsigned dy = ail_compact_bits((e & space_mask_y) >> 1);
+
+      offs[e] = dx * sizeof(T) + dy * linear_pitch_B;
+      line_w = MAX2(line_w, dx + 1);
+      line_h = MAX2(line_h, dy + 1);
+   }
 
 #if defined(__aarch64__)
    /* A line is an 8-element-wide block: 8 rows of 8 bytes (8-bit) or 4 rows
@@ -317,27 +326,31 @@ ail_lines_small(void *_tiled, void *_linear,
 
       for (unsigned tx = sx / tw; tx <= (ex - 1) / tw; ++tx) {
          unsigned x0 = tx * tw;
-
-         if (x0 < sx || x0 + tw > ex || y0 < sy || y0 + th > ey) {
-            unsigned px = MAX2(x0, sx), py = MAX2(y0, sy);
-
-            memcpy_small<T, is_store>(
-               _tiled,
-               linear + (py - sy) * linear_pitch_B + (px - sx) * sizeof(T),
-               tiled_layout, level, linear_pitch_B, px, py,
-               MIN2(x0 + tw, ex) - px, MIN2(y0 + th, ey) - py);
-            continue;
-         }
+         bool partial = x0 < sx || x0 + tw > ex || y0 < sy || y0 + th > ey;
 
          T *tile = tiled + (ty * tiles_per_row + tx) * area;
-         uint8_t *base =
-            linear + (y0 - sy) * linear_pitch_B + (x0 - sx) * sizeof(T);
 
          for (unsigned i = 0; i < area; i += n) {
-            unsigned bx = ail_compact_bits(i & space_mask_x);
-            unsigned by = ail_compact_bits((i & space_mask_y) >> 1);
-            uint8_t *l = base + by * linear_pitch_B + bx * sizeof(T);
+            unsigned bx = x0 + ail_compact_bits(i & space_mask_x);
+            unsigned by = y0 + ail_compact_bits((i & space_mask_y) >> 1);
             T blk[64 / sizeof(T)];
+
+            if (partial &&
+                (bx < sx || bx + line_w > ex || by < sy || by + line_h > ey)) {
+               unsigned px = MAX2(bx, sx), py = MAX2(by, sy);
+               unsigned qx = MIN2(bx + line_w, ex), qy = MIN2(by + line_h, ey);
+
+               if (px < qx && py < qy) {
+                  memcpy_small<T, is_store>(
+                     _tiled,
+                     linear + (py - sy) * linear_pitch_B + (px - sx) * sizeof(T),
+                     tiled_layout, level, linear_pitch_B, px, py, qx - px,
+                     qy - py);
+               }
+               continue;
+            }
+
+            uint8_t *l = linear + (by - sy) * linear_pitch_B + (bx - sx) * sizeof(T);
 
 #if defined(__aarch64__)
             if (neon) {
